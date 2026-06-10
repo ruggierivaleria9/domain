@@ -13,7 +13,6 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const dns = require('dns');
-const AdmZip = require('adm-zip');
 const tls = require('tls');
 const net = require('net');
 const { URL } = require('url');
@@ -62,7 +61,7 @@ const BUNNY_API_KEY = '';
 // --- Fonti target ---
 const LOAD_FROM_SITE = false;
 const LOAD_FROM_CIDR = false;
-const LOAD_FROM_WHOISDS = true;    // WhoisDS newly registered domains (daily)
+const LOAD_FROM_WHOISDS = true;    // NRD (cenk/nrd) newly registered domains
 const USE_REV = true;
 
 // --- Performance ---
@@ -77,8 +76,8 @@ const NUM_WORKERS = 1;
 const POOL_REFRESH_CYCLES = 1;    // ogni quanti cicli ricaricare gli IP range AWS
 const PROBE_CONCURRENCY = 10;      // max richieste HTTP simultanee in fase probe
 const SCAN_SITE_CONCURRENCY = 10;   // max siti scansionati in parallelo
-const WHOISDS_DAYS = 45;           // WhoisDS free tier: ~45 giorni disponibili
-const WHOISDS_DOMAINS_PER_CHUNK = 10; // domini da scansionare per batch
+const NRD_URL = 'https://dl.cenk.app/nrd/nrd-last-60-days.txt';  // ~4.2M domains, single TXT file
+const NRD_DOMAINS_PER_CHUNK = 10; // domini da scansionare per batch
 
 // ─── Derived constants ─────────────────────────────────────────
 const s3Client = new S3Client({
@@ -89,7 +88,7 @@ const s3Client = new S3Client({
 const RESULT_DIR = path.join(DATA_DIR, 'risultati');
 const NEW_PATH_EXTRACT = path.join(RESULT_DIR, 'DATA_SPLIT');
 const SITE_DIR = path.join(DATA_DIR, 'site');
-const WHOISDS_DIR = path.join(DATA_DIR, 'whoisds');  // Cache WhoisDS daily ZIPs
+const NRD_CACHE = path.join(DATA_DIR, 'nrd_cache');  // Cache NRD domain list
 const LOGS_DIR = path.join(DATA_DIR, 'logs');
 const CONTAINER_NAME = process.env.HOSTNAME || `local_${Math.floor(Date.now() / 1000)}`;
 const SLOT_HASH = parseInt(crypto.createHash('md5').update(CONTAINER_NAME).digest('hex').slice(0, 12), 16);
@@ -477,161 +476,99 @@ async function deleteSiteFile(filepath) {
 }
 
 // ================================================================
-// WHOISDS — Newly Registered Domains (daily)
+// NRD — Newly Registered Domains (cenk/nrd mirror of WhoisDS)
 // ================================================================
-// WhoisDS URL format: https://www.whoisds.com/whois-database/newly-registered-domains/{base64(date.zip)}/nrd
-// Each ZIP contains a single {date}.txt with one domain per line.
-// Partitioning: each instance picks a day from the last 365 days.
-//   dayIndex = (instanceId + cycleOffset * totalInstances) % WHOISDS_DAYS
-//   date = today - dayIndex days
+// Source: https://dl.cenk.app/nrd/nrd-last-60-days.txt
+// One plain TXT file, ~4.2M domains, no ZIP, no auth, just download & process.
+// Each instance takes its own chunk based on INSTANCE_ID.
 
-function whoisdsDateStr(daysAgo) {
-  const d = new Date();
-  d.setDate(d.getDate() - daysAgo);
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${d.getFullYear()}-${mm}-${dd}`;
-}
+async function downloadNrdFile() {
+  await fs.promises.mkdir(NRD_CACHE, { recursive: true });
+  const cachePath = path.join(NRD_CACHE, 'nrd-domains.txt');
 
-function whoisdsZipName(daysAgo) {
-  return whoisdsDateStr(daysAgo) + '.zip';
-}
-
-function whoisdsTxtName(daysAgo) {
-  return whoisdsDateStr(daysAgo) + '.txt';
-}
-
-async function downloadWhoisDsDay(daysAgo) {
-  const dateStr = whoisdsDateStr(daysAgo);
-  const zipName = dateStr + '.zip';
-  const zipPath = path.join(WHOISDS_DIR, zipName);
-  const txtPath = path.join(WHOISDS_DIR, dateStr + '.txt');
-
-  // Already extracted
-  try { await fs.promises.access(txtPath); return txtPath; } catch (_) {}
-
-  // Already downloaded but not extracted
-  let zipExists = false;
-  try { await fs.promises.access(zipPath); zipExists = true; } catch (_) {}
-
-  if (!zipExists) {
-    // WhoisDS uses base64-encoded filename in the URL path + /nrd suffix
-    const b64 = Buffer.from(zipName).toString('base64');
-    const url = `https://www.whoisds.com/whois-database/newly-registered-domains/${b64}/nrd`;
-    log(`[WHOISDS] Downloading ${zipName}...`);
-    try {
-      const res = await ax.get(url, { timeout: 120000, responseType: 'arraybuffer' });
-      if (res.status !== 200) {
-        log(`[WHOISDS] HTTP ${res.status} for ${zipName}`);
-        return null;
-      }
-      await fs.promises.writeFile(zipPath, res.data);
-      log(`[WHOISDS] Downloaded ${zipName} (${(res.data.length / 1024 / 1024).toFixed(1)} MB)`);
-    } catch (e) {
-      log(`[WHOISDS] Download failed ${zipName}: ${e.message}`);
-      return null;
-    }
-  }
-
-  // Extract: WhoisDS ZIPs contain a single .txt file
+  // Already downloaded today? Check file age (< 24h)
   try {
-    const zipData = await fs.promises.readFile(zipPath);
-    const zip = new AdmZip(zipData);
-    const entries = zip.getEntries();
-    for (const entry of entries) {
-      if (entry.entryName.endsWith('.txt') && !entry.isDirectory) {
-        const domainData = entry.getData().toString('utf8');
-        await fs.promises.writeFile(txtPath, domainData, 'utf8');
-        log(`[WHOISDS] Extracted ${entry.entryName} -> ${dateStr}.txt (${domainData.split('\n').length.toLocaleString()} domains)`);
-        return txtPath;
-      }
+    const stat = await fs.promises.stat(cachePath);
+    if (Date.now() - stat.mtimeMs < 24 * 60 * 60 * 1000) {
+      log(`[NRD] Using cached domain list (${(stat.size/1024/1024).toFixed(1)} MB, updated ${new Date(stat.mtime).toISOString().slice(0,10)})`);
+      return cachePath;
     }
-    log(`[WHOISDS] No .txt found inside ${zipName}`);
-    return null;
-  } catch (e) {
-    log(`[WHOISDS] Extract failed ${zipName}: ${e.message}`);
-    // Remove corrupted zip so it retries next time
-    try { await fs.promises.unlink(zipPath); } catch (_) {}
-    return null;
-  }
-}
-
-// Carica un chunk di domini dal file WhoisDS giornaliero.
-// Ogni chiamata restituisce fino a WHOISDS_DOMAINS_PER_CHUNK domini,
-// avanzando un cursore interno salvato in un file .pos.
-// Ritorna { targets: [...], filepath, done: bool } — done=true quando il file e' finito.
-async function loadSitesFromWhoisDS(cycleOffset) {
-  if (!LOAD_FROM_WHOISDS) return { targets: [], filepath: null, done: true };
-
-  await fs.promises.mkdir(WHOISDS_DIR, { recursive: true });
-
-  // Calcola il giorno assegnato a questa istanza
-  const dayIndex = (INSTANCE_ID + cycleOffset * TOTAL_SLOTS) % WHOISDS_DAYS;
-  const txtPath = await downloadWhoisDsDay(dayIndex);
-  if (!txtPath) {
-    log(`[WHOISDS] Instance ${INSTANCE_ID} — day ${dayIndex} (${whoisdsDateStr(dayIndex)}) FAILED. Skipping.`);
-    return { targets: [], filepath: null, done: true };
-  }
-
-  // Cursor file per tenere traccia di dove siamo nel file
-  const posFile = txtPath + '.pos';
-
-  let offset = 0;
-  try {
-    offset = parseInt(await fs.promises.readFile(posFile, 'utf8'), 10) || 0;
   } catch (_) {}
 
-  // Leggi a chunk
-  const fd = await fs.promises.open(txtPath, 'r');
-  let readPos = 0;
-  const chunkSize = 64 * 1024; // 64KB read buffer
-  const buf = Buffer.alloc(chunkSize);
-  const domains = [];
+  log(`[NRD] Downloading domain list from ${NRD_URL}...`);
+  const res = await ax.get(NRD_URL, { timeout: 300000, responseType: 'text' });
+  if (res.status !== 200) {
+    log(`[NRD] HTTP ${res.status} — download failed`);
+    return null;
+  }
+
+  const lines = res.data.split('\n').filter(l => !l.startsWith('#') && l.trim());
+  log(`[NRD] Downloaded ${(res.data.length/1024/1024).toFixed(1)} MB — ${lines.length.toLocaleString()} domains`);
+
+  await fs.promises.writeFile(cachePath, res.data, 'utf8');
+  return cachePath;
+}
+
+// Each instance reads a CHUNK of domains from its assigned slice of the file.
+// All instances share the same cached file, but each reads a different part.
+// Returns { targets: [...], done: bool }
+async function loadSitesFromNrd(chunkIndex) {
+  if (!LOAD_FROM_WHOISDS) return { targets: [], done: true };
+
+  const cachePath = await downloadNrdFile();
+  if (!cachePath) {
+    log(`[NRD] Instance ${INSTANCE_ID} — download failed. Retrying later.`);
+    return { targets: [], done: false };
+  }
+
+  // Each instance gets a fixed starting offset based on INSTANCE_ID
+  // and advances by chunkIndex * NRD_DOMAINS_PER_CHUNK each call
+  const stat = await fs.promises.stat(cachePath);
+
+  // Read file minimally: seek to instance's area and read a chunk
+  const fd = await fs.promises.open(cachePath, 'r');
+  let domains = [];
+  let linesScanned = 0;
+  const maxLines = 50000; // safety limit
 
   try {
-    // Seek to saved offset
-    if (offset > 0) {
-      const stat = await fd.stat();
-      if (offset >= stat.size) {
-        // File finito, cancella .pos e ritorna done
-        await fd.close();
-        try { await fs.promises.unlink(posFile); } catch (_) {}
-        log(`[WHOISDS] Instance ${INSTANCE_ID} — day ${dayIndex} (${whoisdsDateStr(dayIndex)}) COMPLETED.`);
-        return { targets: [], filepath: txtPath, done: true };
-      }
-    }
-
+    // Simple approach: stream from start, skip lines owned by other instances
+    const chunkSize = 256 * 1024;
+    const buf = Buffer.alloc(chunkSize);
+    let readPos = 0;
     let leftover = '';
-    while (domains.length < WHOISDS_DOMAINS_PER_CHUNK) {
-      const { bytesRead } = await fd.read(buf, 0, chunkSize, offset + readPos);
+    const startLine = INSTANCE_ID * NRD_DOMAINS_PER_CHUNK + chunkIndex * NRD_DOMAINS_PER_CHUNK * TOTAL_SLOTS;
+
+    while (domains.length < NRD_DOMAINS_PER_CHUNK && linesScanned < maxLines) {
+      const { bytesRead } = await fd.read(buf, 0, chunkSize, readPos);
       if (bytesRead === 0) break;
       readPos += bytesRead;
 
-      const text = leftover + buf.toString('utf8', 0, bytesRead);
+      const text = (leftover + buf.toString('utf8', 0, bytesRead)).replace(/\r/g, '');
       const lines = text.split('\n');
-      leftover = lines.pop(); // ultima linea potrebbe essere troncata
+      leftover = lines.pop() || '';
 
       for (const line of lines) {
+        // Skip comments
+        if (line.startsWith('#')) continue;
         const d = line.trim().toLowerCase();
-        if (d && domains.length < WHOISDS_DOMAINS_PER_CHUNK) {
-          domains.push(getInitialUrl(d));
-        }
+        if (!d) continue;
+
+        linesScanned++;
+        if (linesScanned <= startLine) continue; // skip lines for other instances
+        if (domains.length >= NRD_DOMAINS_PER_CHUNK) break;
+
+        domains.push(getInitialUrl(d));
       }
     }
-
-    // Salva nuova posizione
-    const newOffset = offset + readPos;
-    await fs.promises.writeFile(posFile, String(newOffset), 'utf8');
-
-    const dateStr = whoisdsDateStr(dayIndex);
-    const moreLeft = domains.length >= WHOISDS_DOMAINS_PER_CHUNK;
-    log(`[WHOISDS] Instance ${INSTANCE_ID}/${TOTAL_SLOTS} — day ${dayIndex} (${dateStr}): ${domains.length.toLocaleString()} domains loaded${moreLeft ? ' (more available)' : ' (last chunk)'}`);
-
-    return { targets: domains, filepath: txtPath, done: !moreLeft };
-
   } finally {
     await fd.close();
   }
+
+  const moreLeft = domains.length >= NRD_DOMAINS_PER_CHUNK;
+  log(`[NRD] Instance ${INSTANCE_ID}/${TOTAL_SLOTS} — chunk #${chunkIndex}: ${domains.length.toLocaleString()} domains${moreLeft ? ' (more available)' : ' (last chunk — file exhausted? advancing to next cycle)'}`);
+
+  return { targets: domains, done: !moreLeft };
 }
 
 // ================================================================
@@ -1311,27 +1248,27 @@ async function workerLoop(workerId) {
       }
     }
 
-    // Phase WHOISDS — newly registered domains, one day per instance
+    // Phase NRD — newly registered domains, partitioned across instances
     if (LOAD_FROM_WHOISDS) {
-      let whoisdsCycle = 0;
+      let nrdChunk = 0;
       while (true) {
-        const { targets, filepath, done } = await loadSitesFromWhoisDS(whoisdsCycle);
-        if (targets.length === 0) {
-          if (done) {
-            log(`[WHOISDS] Instance ${INSTANCE_ID} — Day completed. Advancing to next day...`);
-            whoisdsCycle++;  // next cycleOffset -> next day
-            // Small sleep to avoid hammering the same day's download
-            await sleep(5000);
-            continue;
-          }
-          break;
+        const { targets, done } = await loadSitesFromNrd(nrdChunk);
+        if (targets.length > 0) {
+          log(`[NRD] Scanning ${targets.length.toLocaleString()} domains from chunk #${nrdChunk}...`);
+          await processUrls(targets).catch(e => log(`[NRD] Error: ${e.message}`));
         }
-        log(`[WHOISDS] Scanning ${targets.length.toLocaleString()} domains from chunk...`);
-        await processUrls(targets).catch(e => log(`[WHOISDS] Error: ${e.message}`));
-        // Continua con lo stesso giorno, prossimo chunk
+        if (done) {
+          nrdChunk++;
+          // Reached end of file? Wrap around with sleep
+          if (targets.length === 0) {
+            log(`[NRD] Instance ${INSTANCE_ID} — file exhausted. Waiting before re-scan...`);
+            await sleep(300000); // 5 min
+          }
+          continue;
+        }
+        // Not done, more chunks available immediately
+        nrdChunk++;
       }
-      // Se finisce tutti i giorni, continua il loop (CIDR phase)
-      log(`[WHOISDS] Instance ${INSTANCE_ID} — Finished all ${WHOISDS_DAYS} days.`);
     }
 
     // Phase CIDR
